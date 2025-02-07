@@ -341,10 +341,10 @@ print(impute_methods)
 
 # Perform the imputation
 tryCatch({
-  pans_imputed <- mice(pans_for_imputation, m = 100, method = impute_methods, seed = 080299)
+  pans_imputed <- mice(pans_for_imputation, m = 70, method = impute_methods, seed = 080299)
   
   # Extract completed datasets
-  pans_imputed_datasets <- lapply(1:100, function(i) complete(pans_imputed, i))
+  pans_imputed_datasets <- lapply(1:70, function(i) complete(pans_imputed, i))
   
   # Check the first completed dataset
   print(head(pans_imputed_datasets[[1]]))
@@ -480,99 +480,270 @@ write.csv(pans_adult, "final_clusters_lca.csv", row.names = FALSE)
 
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
-# 9. Unadjusted Tobit regression for classified groups (weighted)
+# 9. Unadjusted Ordinal Logistic Regression for classified groups (weighted)
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
 
-# Fit a Tobit model for a specified outcome
-fit_tobit_model_unad <- function(dataset, outcome) {
+# Function to fit an ordinal logistic regression model using svyolr()
+fit_svyolr_model_unad <- function(dataset, outcome) {
   formula <- as.formula(paste(outcome, "~ Pooled_Class"))
   
-  vglm(
-    formula,
-    family = tobit(Lower = 0, Upper = 11),  # Bounds for the Tobit model
-    data = dataset,
-    weights = dataset$Weight_Percent       # Include weights
-  )
+  # Define survey design
+  svy_design <- svydesign(ids = ~1, weights = ~Weight_Percent, data = dataset)
+  
+  # Fit ordinal logistic regression
+  svyolr(formula, design = svy_design)
 }
 
-# Defined list of outcomes and var names here
+# Defined list of outcomes and variable names
 outcomes <- c("Wellbeing_satisfied", "Wellbeing_happy", "Wellbeing_worthwhile", "Wellbeing_lonely")
 variable_names <- c("satisfied", "happy", "worthwhile", "lonely")  # Desired suffix for object names
 
+# Store unadjusted models
+unadjusted_olr_models <- list()
+num_imputations <- length(imputed_list)
+
 # Loop through each outcome
-unadjusted_tobit_models <- list()
 for (i in seq_along(outcomes)) {
   outcome <- outcomes[i]
   var_name <- variable_names[i]
   
-  # Fit Tobit models for all imputed datasets for the current outcome
-  tobit_models <- lapply(imputed_list, fit_tobit_model_unad, outcome = outcome)
+  # Fit OLR models for all imputed datasets
+  olr_models <- vector("list", length = num_imputations)
   
-  # Extract coefficients and pool manually
-  pooled_coefficients <- Reduce("+", lapply(tobit_models, coef)) / length(tobit_models)
+  cat("\nAnalyzing outcome:", outcome, "(", i, "of", length(outcomes), ")\n")
   
-  # Store the pooled model results
-  unadjusted_tobit_models[[var_name]] <- pooled_coefficients
+  for (k in seq_along(imputed_list)) {
+    cat("  Processing imputation:", k, "of", num_imputations, "\n")
+    imputed_data <- imputed_list[[k]]
+    
+    tryCatch({
+      olr_models[[k]] <- fit_svyolr_model_unad(imputed_data, outcome)
+    }, error = function(e) {
+      olr_models[[k]] <- NULL
+    })
+  }
+  
+  olr_models <- olr_models[!sapply(olr_models, is.null)]
+  
+  if (length(olr_models) > 1) {
+    # Pool results using Rubin's rules
+    qhat <- do.call(rbind, lapply(olr_models, coef))
+    u <- lapply(olr_models, vcov)
+    W <- Reduce("+", u) / length(u)
+    B <- var(qhat)
+    m <- length(olr_models)
+    T <- W + (1 + 1/m) * B
+    
+    pooled_coefficients <- colMeans(qhat)
+    pooled_se <- sqrt(diag(T))
+    lower_ci <- pooled_coefficients - 1.96 * pooled_se
+    upper_ci <- pooled_coefficients + 1.96 * pooled_se
+    p_values <- 2 * (1 - pnorm(abs(pooled_coefficients / pooled_se)))  # Compute p-values
+    
+    # Store results
+    pooled_results <- list(
+      coefficients = pooled_coefficients,
+      variance = T,
+      se = pooled_se,
+      lower_ci = lower_ci,
+      upper_ci = upper_ci,
+      p_values = p_values
+    )
+    
+    unadjusted_olr_models[[var_name]] <- pooled_results
+    
+    cat("\nUnadjusted Model -", outcome, ":\n")
+    print(data.frame(
+      Coefficients = pooled_coefficients,
+      SE = pooled_se,
+      Lower_CI = lower_ci,
+      Upper_CI = upper_ci,
+      P_Value = p_values
+    ))
+  }
 }
 
-# Print unadjusted results
-cat("\nPooled Unadjusted Tobit Results:\n")
-print(unadjusted_tobit_models)
+saveRDS(unadjusted_olr_models, file = "unadjusted_ordinal_model_results_lca.rds")
 
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
-# 10. Adjusted Tobit regression for classified groups (weighted)
+# 10. Adjusted Ordinal Logistic Regression for classified groups (weighted)
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
 
-# Fit an adjusted Tobit model for a specified outcome
-fit_tobit_model_ad <- function(dataset, outcome) {
+# Function to fit an adjusted ordinal logistic regression model using svyolr()
+fit_svyolr_model_ad <- function(dataset, outcome) {
   formula <- as.formula(paste(outcome, "~ Pooled_Class + Age_Band + Gender + Income + General_Health + Activity"))
   
-  vglm(
-    formula,
-    family = tobit(Lower = 0, Upper = 11),  # Bounds for the Tobit model
-    data = dataset,
-    weights = dataset$Weight_Percent       # Include weights
-  )
+  # Define survey design
+  svy_design <- svydesign(ids = ~1, weights = ~Weight_Percent, data = dataset)
+  
+  # Fit ordinal logistic regression
+  svyolr(formula, design = svy_design)
 }
 
+# Store adjusted models
+adjusted_olr_models <- list()
+
 # Loop through each outcome
-adjusted_tobit_models <- list()
 for (i in seq_along(outcomes)) {
   outcome <- outcomes[i]
   var_name <- variable_names[i]
   
-  # Fit adjusted Tobit models for all imputed datasets
-  tobit_models_adj <- lapply(imputed_list, fit_tobit_model_ad, outcome = outcome)
+  # Fit OLR models for all imputed datasets
+  olr_models_adj <- vector("list", length = num_imputations)
   
-  # Extract coefficients and pool manually
-  pooled_coefficients <- Reduce("+", lapply(tobit_models_adj, coef)) / length(tobit_models_adj)
+  cat("\nAnalyzing outcome:", outcome, "(", i, "of", length(outcomes), ")\n")
   
-  # Store the pooled model results
-  adjusted_tobit_models[[var_name]] <- pooled_coefficients
+  for (k in seq_along(imputed_list)) {
+    cat("  Processing imputation:", k, "of", num_imputations, "\n")
+    imputed_data <- imputed_list[[k]]
+    
+    tryCatch({
+      olr_models_adj[[k]] <- fit_svyolr_model_ad(imputed_data, outcome)
+    }, error = function(e) {
+      olr_models_adj[[k]] <- NULL
+    })
+  }
+  
+  olr_models_adj <- olr_models_adj[!sapply(olr_models_adj, is.null)]
+  
+  if (length(olr_models_adj) > 1) {
+    # Pool results using Rubin's rules
+    qhat <- do.call(rbind, lapply(olr_models_adj, coef))
+    u <- lapply(olr_models_adj, vcov)
+    W <- Reduce("+", u) / length(u)
+    B <- var(qhat)
+    m <- length(olr_models_adj)
+    T <- W + (1 + 1/m) * B
+    
+    pooled_coefficients <- colMeans(qhat)
+    pooled_se <- sqrt(diag(T))
+    lower_ci <- pooled_coefficients - 1.96 * pooled_se
+    upper_ci <- pooled_coefficients + 1.96 * pooled_se
+    p_values <- 2 * (1 - pnorm(abs(pooled_coefficients / pooled_se)))  # Compute p-values
+    
+    # Store results
+    pooled_results <- list(
+      coefficients = pooled_coefficients,
+      variance = T,
+      se = pooled_se,
+      lower_ci = lower_ci,
+      upper_ci = upper_ci,
+      p_values = p_values
+    )
+    
+    adjusted_olr_models[[var_name]] <- pooled_results
+    
+    cat("\nAdjusted Model -", outcome, ":\n")
+    print(data.frame(
+      Coefficients = pooled_coefficients,
+      SE = pooled_se,
+      Lower_CI = lower_ci,
+      Upper_CI = upper_ci,
+      P_Value = p_values
+    ))
+  }
 }
 
-# Print adjusted results
-cat("\nPooled Adjusted Tobit Results:\n")
-print(adjusted_tobit_models)
+saveRDS(adjusted_olr_models, file = "adjusted_ordinal_model_results_lca.rds")
 
-# Save the regression models
-saveRDS(unadjusted_tobit_models, "unadjusted_tobit_models_lca.rds")
-saveRDS(adjusted_tobit_models, "adjusted_tobit_models_lca.rds")
+# Save the entire workspace
+save.image(file = "full_environment_lca.RData")
 
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
-# 13. Export faceted coefficient plots for pooled results (unadjusted and adjusted)
+# 13. Convert and export adjusted and unadjusted models as tables 
+#-------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------
+
+# unadjusted models to csv
+unadjusted_results_df <- bind_rows(lapply(unadjusted_olr_models, function(x) {
+  data.frame(
+    Coefficients = x$coefficients,
+    SE = x$se,
+    Lower_CI = x$lower_ci,
+    Upper_CI = x$upper_ci,
+    P_Value = x$p_values
+  )
+}), .id = "Outcome")
+
+# Save as CSV for review
+write.csv(unadjusted_results_df, "unadjusted_ordinal_results.csv", row.names = FALSE)
+
+# Print a preview
+print(head(unadjusted_results_df, 10))
+
+
+# adjusted models to csv
+adjusted_results_df <- bind_rows(lapply(adjusted_olr_models, function(x) {
+  data.frame(
+    Coefficients = x$coefficients,
+    SE = x$se,
+    Lower_CI = x$lower_ci,
+    Upper_CI = x$upper_ci,
+    P_Value = x$p_values
+  )
+}), .id = "Outcome")
+
+# Save as CSV for review
+write.csv(adjusted_results_df, "adjusted_ordinal_results.csv", row.names = FALSE)
+
+# Print a preview
+print(head(adjusted_results_df, 10))
+
+#-------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------
+# 14. Export faceted coefficient plots for pooled results (unadjusted and adjusted)
 # Coef plots with CI percentages etc. 
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
 
+# Convert model results to a structured data frame
+convert_results_to_df <- function(model_results, model_type) {
+  bind_rows(lapply(model_results, function(x) {
+    data.frame(
+      Outcome = names(model_results),
+      Term = names(x$coefficients),
+      Coefficient = x$coefficients,
+      SE = x$se,
+      Lower_CI = x$lower_ci,
+      Upper_CI = x$upper_ci,
+      P_Value = x$p_values,
+      Model = model_type
+    )
+  }))
+}
 
+# Convert unadjusted and adjusted results into data frames
+unadjusted_df <- convert_results_to_df(unadjusted_olr_models, "Unadjusted")
+adjusted_df <- convert_results_to_df(adjusted_olr_models, "Adjusted")
+
+# Combine both into a single data frame
+plot_df <- bind_rows(unadjusted_df, adjusted_df)
+
+# Create coefficient plot
+coef_plot <- ggplot(plot_df, aes(x = Term, y = Coefficient, color = Model)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +  # Points for coefficients
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), 
+                position = position_dodge(width = 0.5), width = 0.2) +  # CI bars
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Reference line at 0
+  facet_wrap(~ Outcome, scales = "free_x") +  # Facet by outcome variable
+  theme_minimal() +
+  labs(title = "Coefficient Plots for Ordinal Logistic Regression",
+       x = "Predictor Variables",
+       y = "Coefficient (95% CI)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save the plot
+ggsave("ordinal_logistic_coef_plot.png", coef_plot, width = 10, height = 6, dpi = 300)
+
+# Display the plot
+print(coef_plot)
 
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
-# 14. END OF ANALYSIS
+# END OF ANALYSIS
 #-------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------
